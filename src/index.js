@@ -9,6 +9,7 @@ const {Firestore, WriteBatch, CollectionReference, FieldValue, FieldPath, Timest
 const semver = require('semver');
 const asyncHooks = require('async_hooks');
 const callsites = require('callsites');
+const { cwd } = require('process');
 
 const readFile = util.promisify(fs.readFile);
 const readdir = util.promisify(fs.readdir);
@@ -197,7 +198,7 @@ async function trackAsync({log, file, forceWait}, fn) {
 }
 trackAsync[dontTrack] = true;
 
-async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug = false, require: req, forceWait = false} = {}) {
+async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug = false, require: req, forceWait = false, showstats = false} = {}) {
 	if (req) {
 		try {
 			require(req);
@@ -242,38 +243,18 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 	let files = filenames.map(filename => {
 		// Skip files that start with a dot
 		if (filename[0] === '.') return;
-		
-		const [filenameVersion, description] = filename.split('__');
-		const coerced = semver.coerce(filenameVersion);
 
-		if (!coerced) {
-			if (description) {
-				// If there's a description, we assume you meant to use this file
-				log(`WARNING: ${filename} doesn't have a valid semver version`);
-			}
-			return null;
+		// Expecting a filename like: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s
+		const match = filename.match(/^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_([^.]+).[jt]s$/);
+		if (!match) {
+			throw new Error(`Invalid filename: ${filename}. Expecting: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s`);
 		}
-
-		// If there's a version, but no description, we have an issue
-		if (!description) {
-			throw new Error(`This filename doesn't match the required format: ${filename}`);
-		}
-
-		const {version} = coerced;
-
-		const existingFile = versionToFile.get(version);
-		if (existingFile) {
-			throw new Error(`Both ${filename} and ${existingFile} have the same version`);
-		}
-		versionToFile.set(version, filename);
 
 		return {
 			filename,
-			path: path.join(dir, filename),
-			version,
-			description: path.basename(description, path.extname(description))
+			path: path.join(dir, filename)
 		};
-	}).filter(Boolean);
+	}).filter(Boolean).sort((a, b) => a.filename < b.filename ? -1 : 1);
 
 	stats.scannedFiles = files.length;
 	log(`Found ${stats.scannedFiles} migration files`);
@@ -301,28 +282,21 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 
 	const collection = firestore.collection('fireway');
 
-	// Get the latest migration
-	const result = await collection
-		.orderBy('installed_rank', 'desc')
-		.limit(1)
-		.get();
-	const [latestDoc] = result.docs;
-	const latest = latestDoc && latestDoc.data();
+	const migrationDocs = await collection.orderBy('name').get()
 
-	if (latest && !latest.success) {
-		throw new Error(`Migration to version ${latest.version} using ${latest.script} failed! Please restore backups and roll back database and code!`);
+	let doc
+	while (doc = migrationDocs.docs.shift()) {
+		if (doc.filename === files[0].filename) {
+			files.shift()
+			continue
+		} else {
+			break
+		}
 	}
 
-	let installed_rank;
-	if (latest) {
-		files = files.filter(file => semver.gt(file.version, latest.version));
-		installed_rank = latest.installed_rank;
-	} else {
-		installed_rank = -1;
+	if (migrationDocs.length) {
+		throw new Error('Migrations were not run in order. Roll back database and try again.')
 	}
-
-	// Sort them by semver
-	files.sort((f1, f2) => semver.compare(f1.version, f2.version));
 
 	log(`Executing ${files.length} migration files`);
 
@@ -353,6 +327,10 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 			}
 		});
 
+		if (!success) {
+			throw new Error('Migration of ' + file.filename + ' failed. Roll back database and try again.');
+		}
+
 		// Upload the results
 		log(`Uploading the results for ${file.filename}`);
 
@@ -360,26 +338,12 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 		stats.frozen = true;
 
 		installed_rank += 1;
-		const id = `${installed_rank}-${file.version}-${file.description}`;
 		await collection.doc(id).set({
-			installed_rank,
-			description: file.description,
-			version: file.version,
-			script: file.filename,
-			type: path.extname(file.filename).slice(1),
-			checksum: md5(await readFile(file.path)),
-			installed_by: os.userInfo().username,
-			installed_on: start,
-			execution_time: finish - start,
-			success
+			filename: file.filename
 		});
 
 		// Unfreeze stat tracking
 		delete stats.frozen;
-
-		if (!success) {
-			throw new Error('Stopped at first failure');
-		}
 	}
 
 	// Ensure firebase terminates
@@ -390,11 +354,44 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 	const {scannedFiles, executedFiles, added, created, updated, set, deleted} = stats;
 	log('Finished all firestore migrations');
 	log(`Files scanned:${scannedFiles} executed:${executedFiles}`);
-	log(`Docs added:${added} created:${created} updated:${updated} set:${set} deleted:${deleted}`);
+	showstats && console.log(`Docs added:${added} created:${created} updated:${updated} set:${set} deleted:${deleted}`);
 
 	statsMap.delete(stats);
 
 	return stats;
 }
 
-module.exports = {migrate};
+
+function writeFileSyncRecursive(filename, content, charset) {
+  const folders = filename.split(path.sep).slice(0, -1)
+  if (folders.length) {
+    // create folder path if it doesn't exist
+    folders.reduce((last, folder) => {
+      const folderPath = last ? last + path.sep + folder : folder
+      if (!fs.existsSync(folderPath)) {
+        fs.mkdirSync(folderPath)
+      }
+      return folderPath
+    })
+  }
+  fs.writeFileSync(filename, content, charset)
+}
+
+async function addMigration (name, {path: dir = ''} = {}) {
+
+	// Create filename of the form: [YYYY-MM-DD]_[HH:mm:ss]_[name].ts
+	const d = new Date()
+	const filename = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}_${d.getUTCHours()}-${d.getUTCMinutes()}-${d.getUTCSeconds()}_${name}.ts`;
+
+	const filepath = path.resolve(dir, filename);
+
+	writeFileSyncRecursive(filepath, `import { MigrateOptions } from "fireway";
+
+module.exports.migrate = async (opts: MigrateOptions) => {
+
+}
+`, 'utf8');
+
+}
+
+module.exports = {migrate, addMigration};
