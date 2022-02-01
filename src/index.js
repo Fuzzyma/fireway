@@ -1,371 +1,368 @@
-const path = require('path');
-const {EventEmitter} = require('events');
-const util = require('util');
-const os = require('os');
-const fs = require('fs');
-const md5 = require('md5');
-const admin = require('firebase-admin');
-const {Firestore, WriteBatch, CollectionReference, FieldValue, FieldPath, Timestamp} = require('@google-cloud/firestore');
-const semver = require('semver');
-const asyncHooks = require('async_hooks');
-const callsites = require('callsites');
-const { cwd } = require('process');
+const path = require('path')
+const { EventEmitter } = require('events')
+const util = require('util')
+const fs = require('fs')
+const admin = require('firebase-admin')
+const { Firestore, WriteBatch, CollectionReference, FieldValue, FieldPath, Timestamp } = require('@google-cloud/firestore')
+const semver = require('semver')
+const asyncHooks = require('async_hooks')
+const callsites = require('callsites')
 
-const readFile = util.promisify(fs.readFile);
-const readdir = util.promisify(fs.readdir);
-const stat = util.promisify(fs.stat);
-const exists = util.promisify(fs.exists);
+const readdir = util.promisify(fs.readdir)
+const stat = util.promisify(fs.stat)
+const access = util.promisify(fs.access)
 
 // Track stats and dryrun setting so we only proxy once.
 // Multiple proxies would create a memory leak.
-const statsMap = new Map();
+const statsMap = new Map()
 
-let proxied = false;
-function proxyWritableMethods() {
-	// Only proxy once
-	if (proxied) return;
-	else proxied = true;
+let proxied = false
+function proxyWritableMethods () {
+  // Only proxy once
+  if (proxied) return
+  else proxied = true
 
-	const ogCommit = WriteBatch.prototype._commit;
-	WriteBatch.prototype._commit = async function() {
-		// Empty the queue
-		while (this._fireway_queue && this._fireway_queue.length) {
-			this._fireway_queue.shift()();
-		}
-		for (const [stats, {dryrun}] of statsMap.entries()) {
-			if (this._firestore._fireway_stats === stats) {
-				if (dryrun) return [];
-			}
-		}
-		return ogCommit.apply(this, Array.from(arguments));
-	};
+  const ogCommit = WriteBatch.prototype._commit
+  WriteBatch.prototype._commit = async function () {
+    // Empty the queue
+    while (this._fireway_queue && this._fireway_queue.length) {
+      this._fireway_queue.shift()()
+    }
+    for (const [stats, { dryrun }] of statsMap.entries()) {
+      if (this._firestore._fireway_stats === stats) {
+        if (dryrun) return []
+      }
+    }
+    return ogCommit.apply(this, Array.from(arguments))
+  }
 
-	const skipWriteBatch = Symbol('Skip the WriteBatch proxy');
+  const skipWriteBatch = Symbol('Skip the WriteBatch proxy')
 
-	function mitm(obj, key, fn) {
-		const original = obj[key];
-		obj[key] = function() {
-			const args = [...arguments];
-			for (const [stats, {log}] of statsMap.entries()) {
-				if (this._firestore._fireway_stats === stats) {
+  function mitm (obj, key, fn) {
+    const original = obj[key]
+    obj[key] = function () {
+      const args = [...arguments]
+      for (const [stats, { log }] of statsMap.entries()) {
+        if (this._firestore._fireway_stats === stats) {
+          // If this is a batch
+          if (this instanceof WriteBatch) {
+            const [, doc] = args
+            if (doc && doc[skipWriteBatch]) {
+              delete doc[skipWriteBatch]
+            } else {
+              this._fireway_queue = this._fireway_queue || []
+              this._fireway_queue.push(() => {
+                fn.call(this, args, (stats.frozen ? {} : stats), log)
+              })
+            }
+          } else {
+            fn.call(this, args, (stats.frozen ? {} : stats), log)
+          }
+        }
+      }
+      return original.apply(this, args)
+    }
+  }
 
-					// If this is a batch
-					if (this instanceof WriteBatch) {
-						const [_, doc] = args;
-						if (doc && doc[skipWriteBatch]) {
-							delete doc[skipWriteBatch];
-						} else {
-							this._fireway_queue = this._fireway_queue || [];
-							this._fireway_queue.push(() => {
-								fn.call(this, args, (stats.frozen ? {} : stats), log);
-							});
-						}
-					} else {
-						fn.call(this, args, (stats.frozen ? {} : stats), log);
-					}
-				}
-			}
-			return original.apply(this, args);
-		}
-	}
+  // Add logs for each WriteBatch item
+  mitm(WriteBatch.prototype, 'create', ([_, doc], stats, log) => {
+    stats.created += 1
+    log('Creating', JSON.stringify(doc))
+  })
 
-	// Add logs for each WriteBatch item
-	mitm(WriteBatch.prototype, 'create', ([_, doc], stats, log) => {
-		stats.created += 1;
-		log('Creating', JSON.stringify(doc));
-	});
+  mitm(WriteBatch.prototype, 'set', ([ref, doc, opts = {}], stats, log) => {
+    stats.set += 1
+    log(opts.merge ? 'Merging' : 'Setting', ref.path, JSON.stringify(doc))
+  })
 
-	mitm(WriteBatch.prototype, 'set', ([ref, doc, opts = {}], stats, log) => {
-		stats.set += 1;
-		log(opts.merge ? 'Merging' : 'Setting', ref.path, JSON.stringify(doc));
-	});
+  mitm(WriteBatch.prototype, 'update', ([ref, doc], stats, log) => {
+    stats.updated += 1
+    log('Updating', ref.path, JSON.stringify(doc))
+  })
 
-	mitm(WriteBatch.prototype, 'update', ([ref, doc], stats, log) => {
-		stats.updated += 1;
-		log('Updating', ref.path, JSON.stringify(doc));
-	});
+  mitm(WriteBatch.prototype, 'delete', ([ref], stats, log) => {
+    stats.deleted += 1
+    log('Deleting', ref.path)
+  })
 
-	mitm(WriteBatch.prototype, 'delete', ([ref], stats, log) => {
-		stats.deleted += 1;
-		log('Deleting', ref.path);
-	});
-
-	mitm(CollectionReference.prototype, 'add', ([doc], stats, log) => {
-		doc[skipWriteBatch] = true;
-		stats.added += 1;
-		log('Adding', JSON.stringify(doc));
-	});
+  mitm(CollectionReference.prototype, 'add', ([doc], stats, log) => {
+    doc[skipWriteBatch] = true
+    stats.added += 1
+    log('Adding', JSON.stringify(doc))
+  })
 }
 
-const dontTrack = Symbol('Skip async tracking to short circuit');
-async function trackAsync({log, file, forceWait}, fn) {
-	// Track filenames for async handles
-	const activeHandles = new Map();
-	const emitter = new EventEmitter();
-	function deleteHandle(id) {
-		if (activeHandles.has(id)) {
-			activeHandles.delete(id);
-			emitter.emit('deleted', id);
-		}
-	}
-	function waitForDeleted() {
-		return new Promise(r => emitter.once('deleted', () => r()));
-	}
-	const hook = asyncHooks.createHook({
-		init(asyncId) {
-			for (const call of callsites()) {
-				// Prevent infinite loops
-				const fn = call.getFunction();
-				if (fn && fn[dontTrack]) {
-					return;
-				}
-				
-				const name = call.getFileName();
-				if (
-					!name ||
-					name == __filename ||
-					name.startsWith('internal/') ||
-					name.startsWith('timers.js')
-				) continue;
+const dontTrack = Symbol('Skip async tracking to short circuit')
+async function trackAsync ({ log, file, forceWait }, fn) {
+  // Track filenames for async handles
+  const activeHandles = new Map()
+  const emitter = new EventEmitter()
+  function deleteHandle (id) {
+    if (activeHandles.has(id)) {
+      activeHandles.delete(id)
+      emitter.emit('deleted', id)
+    }
+  }
+  function waitForDeleted () {
+    return new Promise(resolve => emitter.once('deleted', () => resolve()))
+  }
+  const hook = asyncHooks.createHook({
+    init (asyncId) {
+      for (const call of callsites()) {
+        // Prevent infinite loops
+        const fn = call.getFunction()
+        if (fn && fn[dontTrack]) {
+          return
+        }
 
-				if (name === file.path) {
-					const filename = call.getFileName();
-					const lineNumber = call.getLineNumber();
-					const columnNumber = call.getColumnNumber();
-					activeHandles.set(asyncId, `${filename}:${lineNumber}:${columnNumber}`);
-					break;
-				}
-			}
-		},
-		before: deleteHandle,
-		after: deleteHandle,
-		promiseResolve: deleteHandle
-	}).enable();
+        const name = call.getFileName()
+        if (
+          !name ||
+          name === __filename ||
+          name.startsWith('internal/') ||
+          name.startsWith('timers.js')
+        ) continue
 
-	let logged;
-	async function handleCheck() {
-		while (activeHandles.size) {
-			if (forceWait) {
-				// NOTE: Attempting to add a timeout requires
-				// shutting down the entire process cleanly.
-				// If someone decides not to return proper
-				// Promises, and provides --forceWait, long
-				// waits are expected.
-				if (!logged) {
-					log('Waiting for async calls to resolve');
-					logged = true;
-				}
-				await waitForDeleted();
-			} else {
-				// This always logs in Node <12
-				const nodeVersion = semver.coerce(process.versions.node);
-				if (nodeVersion.major >= 12) {
-					console.warn(
-						'WARNING: fireway detected open async calls. Use --forceWait if you want to wait:',
-						Array.from(activeHandles.values())
-					);
-				}
-				break;
-			}
-		}
-	}
+        if (name === file.path) {
+          const filename = call.getFileName()
+          const lineNumber = call.getLineNumber()
+          const columnNumber = call.getColumnNumber()
+          activeHandles.set(asyncId, `${filename}:${lineNumber}:${columnNumber}`)
+          break
+        }
+      }
+    },
+    before: deleteHandle,
+    after: deleteHandle,
+    promiseResolve: deleteHandle
+  }).enable()
 
-	let rejection;
-	const unhandled = reason => rejection = reason;
-	process.once('unhandledRejection', unhandled);
-	process.once('uncaughtException', unhandled);
-	
-	try {
-		const res = await fn();
-		await handleCheck();
+  let logged
+  async function handleCheck () {
+    while (activeHandles.size) {
+      if (forceWait) {
+        // NOTE: Attempting to add a timeout requires
+        // shutting down the entire process cleanly.
+        // If someone decides not to return proper
+        // Promises, and provides --forceWait, long
+        // waits are expected.
+        if (!logged) {
+          log('Waiting for async calls to resolve')
+          logged = true
+        }
+        await waitForDeleted()
+      } else {
+        // This always logs in Node <12
+        const nodeVersion = semver.coerce(process.versions.node)
+        if (nodeVersion.major >= 12) {
+          console.warn(
+            'WARNING: fireway detected open async calls. Use --forceWait if you want to wait:',
+            Array.from(activeHandles.values())
+          )
+        }
+        break
+      }
+    }
+  }
 
-		// Wait a tick or so for the unhandledRejection
-		await new Promise(r => setTimeout(() => r(), 1));
+  let rejection
+  const unhandled = reason => { rejection = reason }
+  process.once('unhandledRejection', unhandled)
+  process.once('uncaughtException', unhandled)
 
-		process.removeAllListeners('unhandledRejection');
-		process.removeAllListeners('uncaughtException');
-		if (rejection) {
-			log(`Error in ${file.filename}`, rejection);
-			return false;
-		}
-		return res;
-	} catch(e) {
-		log(e);
-		return false;
-	} finally {
-		hook.disable();
-	}
+  try {
+    const res = await fn()
+    await handleCheck()
+
+    // Wait a tick or so for the unhandledRejection
+    await new Promise(resolve => setTimeout(() => resolve(), 1))
+
+    process.removeAllListeners('unhandledRejection')
+    process.removeAllListeners('uncaughtException')
+    if (rejection) {
+      log(`Error in ${file.filename}`, rejection)
+      return false
+    }
+    return res
+  } catch (e) {
+    log(e)
+    return false
+  } finally {
+    hook.disable()
+  }
 }
-trackAsync[dontTrack] = true;
+trackAsync[dontTrack] = true
 
-async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug = false, require: req, forceWait = false, showstats = false} = {}) {
-	if (req) {
-		try {
-			require(req);
-		} catch (e) {
-			console.error(e);
-			throw new Error(`Trouble executing require('${req}');`);
-		}
-	}
+async function migrate ({ path: dir, projectId, storageBucket, dryrun, app, debug = false, require: req, forceWait = false, stats: showstats = false } = {}) {
+  if (req) {
+    try {
+      require(req)
+    } catch (e) {
+      console.error(e)
+      throw new Error(`Trouble executing require('${req}');`)
+    }
+  }
 
-	const log = function() {
-		return debug && console.log.apply(console, arguments);
-	}
+  const log = function () {
+    return debug && console.log.apply(console, arguments)
+  }
 
-	const stats = {
-		scannedFiles: 0,
-		executedFiles: 0,
-		created: 0,
-		set: 0,
-		updated: 0,
-		deleted: 0,
-		added: 0
-	};
+  const stats = {
+    scannedFiles: 0,
+    executedFiles: 0,
+    created: 0,
+    set: 0,
+    updated: 0,
+    deleted: 0,
+    added: 0
+  }
 
-	// Get all the scripts
-	if (!path.isAbsolute(dir)) {
-		dir = path.join(process.cwd(), dir);
-	}
+  // Get all the scripts
+  if (!path.isAbsolute(dir)) {
+    dir = path.join(process.cwd(), dir)
+  }
 
-	if (!(await exists(dir))) {
-		throw new Error(`No directory at ${dir}`);
-	}
+  try {
+    await access(dir, fs.constants.F_OK)
+  } catch {
+    throw new Error(`No directory at ${dir}`)
+  }
 
-	const filenames = [];
-	for (const file of await readdir(dir)) {
-		if (!(await stat(path.join(dir, file))).isDirectory()) {
-			filenames.push(file);
-		}
-	}
+  const filenames = []
+  for (const file of await readdir(dir)) {
+    if (!(await stat(path.join(dir, file))).isDirectory()) {
+      filenames.push(file)
+    }
+  }
 
-	// Parse the version numbers from the script filenames
-	const versionToFile = new Map();
-	let files = filenames.map(filename => {
-		// Skip files that start with a dot
-		if (filename[0] === '.') return;
+  // Parse the version numbers from the script filenames
+  const files = filenames.map(filename => {
+    // Skip files that start with a dot
+    if (filename[0] === '.') return null
 
-		// Expecting a filename like: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s
-		const match = filename.match(/^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_([^.]+).[jt]s$/);
-		if (!match) {
-			throw new Error(`Invalid filename: ${filename}. Expecting: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s`);
-		}
+    // Expecting a filename like: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s
+    const match = filename.match(/^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_([^.]+).[jt]s$/)
+    if (!match) {
+      throw new Error(`Invalid filename: ${filename}. Expecting: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s`)
+    }
 
-		return {
-			filename,
-			path: path.join(dir, filename)
-		};
-	}).filter(Boolean).sort((a, b) => a.filename < b.filename ? -1 : 1);
+    return {
+      filename,
+      path: path.join(dir, filename)
+    }
+  }).filter(Boolean).sort((a, b) => a.filename < b.filename ? -1 : 1)
 
-	stats.scannedFiles = files.length;
-	log(`Found ${stats.scannedFiles} migration files`);
+  stats.scannedFiles = files.length
+  log(`Found ${stats.scannedFiles} migration files`)
 
-	// Find the files after the latest migration number
-	statsMap.set(stats, {dryrun, log});
-	dryrun && log('Making firestore read-only');
-	proxyWritableMethods();
+  // Find the files after the latest migration number
+  statsMap.set(stats, { dryrun, log })
+  dryrun && log('Making firestore read-only')
+  proxyWritableMethods()
 
-	if (!storageBucket && projectId) {
-		storageBucket = `${projectId}.appspot.com`;
-	}
-	
-	const providedApp = app;
-	if (!app) {
-		app = admin.initializeApp({
-			projectId,
-			storageBucket
-		});
-	}
+  if (!storageBucket && projectId) {
+    storageBucket = `${projectId}.appspot.com`
+  }
 
-	// Use Firestore directly so we can mock for dryruns
-	const firestore = new Firestore({projectId});
-	firestore._fireway_stats = stats;
+  const providedApp = app
+  if (!app) {
+    app = admin.initializeApp({
+      projectId,
+      storageBucket
+    })
+  }
 
-	const collection = firestore.collection('fireway');
+  // Use Firestore directly so we can mock for dryruns
+  const firestore = new Firestore({ projectId })
+  firestore._fireway_stats = stats
 
-	const migrationDocs = await collection.orderBy('filename').get()
+  const collection = firestore.collection('fireway')
 
-	let doc
-	while (doc = migrationDocs.docs.shift()) {
-		if (doc.filename === files[0].filename) {
-			files.shift()
-			continue
-		} else {
-			const index = files.findIndex(file => file.filename === doc.filename)
-			if (index > -1) {
-				files.splice(index, 1)
-				console.warn('Migrations were not run in order. Please make sure that migration succeeded.')
-			}
-			break
-		}
-	}
+  const migrationDocs = await collection.orderBy('filename').get()
 
-	if (migrationDocs.length) {
-		console.warn('The following migrations existed before but a corresponding file wasnt found:', migrationDocs.map(doc => doc.filename))
-	}
+  let doc
+  while ((doc = migrationDocs.docs.shift())) {
+    if (doc.filename === files[0].filename) {
+      files.shift()
+      continue
+    } else {
+      const index = files.findIndex(file => file.filename === doc.filename)
+      if (index > -1) {
+        files.splice(index, 1)
+        console.warn('Migrations were not run in order. Please make sure that migration succeeded.')
+      }
+      break
+    }
+  }
 
-	log(`Executing ${files.length} migration files`);
+  if (migrationDocs.length) {
+    console.warn('The following migrations existed before but a corresponding file wasnt found:', migrationDocs.map(doc => doc.filename))
+  }
 
-	// Execute them in order
-	for (const file of files) {
-		stats.executedFiles += 1;
-		log('Running', file.filename);
-		
-		let migration;
-		try {
-			migration = require(file.path);
-		} catch (e) {
-			log(e);
-			throw e;
-		}
+  log(`Executing ${files.length} migration files`)
 
-		let start, finish;
-		const success = await trackAsync({log, file, forceWait}, async () => {
-			start = new Date();
-			try {
-				await migration.migrate({app, firestore, FieldValue, FieldPath, Timestamp, dryrun});
-				return true;
-			} catch(e) {
-				log(`Error in ${file.filename}`, e);
-				return false;
-			} finally {
-				finish = new Date();
-			}
-		});
+  // Execute them in order
+  for (const file of files) {
+    stats.executedFiles += 1
+    log('Running', file.filename)
 
-		if (!success) {
-			throw new Error('Migration of ' + file.filename + ' failed. Roll back database and try again.');
-		}
+    let migration
+    try {
+      migration = require(file.path)
+    } catch (e) {
+      log(e)
+      throw e
+    }
 
-		// Upload the results
-		log(`Uploading the results for ${file.filename}`);
+    let start, finish
+    const success = await trackAsync({ log, file, forceWait }, async () => {
+      start = new Date()
+      try {
+        await migration.migrate({ app, firestore, FieldValue, FieldPath, Timestamp, dryrun })
+        return true
+      } catch (e) {
+        log(`Error in ${file.filename}`, e)
+        return false
+      } finally {
+        finish = new Date()
+      }
+    })
 
-		// Freeze stat tracking
-		stats.frozen = true;
-		await collection.doc(file.filename).set({
-			filename: file.filename
-		});
+    if (!success) {
+      throw new Error('Migration of ' + file.filename + ' failed. Roll back database and try again.')
+    }
 
-		// Unfreeze stat tracking
-		delete stats.frozen;
-	}
+    // Upload the results
+    log(`Uploading the results for ${file.filename}`)
 
-	// Ensure firebase terminates
-	if (!providedApp) {
-		app.delete();
-	}
+    // Freeze stat tracking
+    stats.frozen = true
+    await collection.doc(file.filename).set({
+      filename: file.filename,
+      installed_on: start,
+      execution_time: finish - start
+    })
 
-	const {scannedFiles, executedFiles, added, created, updated, set, deleted} = stats;
-	log('Finished all firestore migrations');
-	log(`Files scanned:${scannedFiles} executed:${executedFiles}`);
-	showstats && console.log(`Docs added:${added} created:${created} updated:${updated} set:${set} deleted:${deleted}`);
+    // Unfreeze stat tracking
+    delete stats.frozen
+  }
 
-	statsMap.delete(stats);
+  // Ensure firebase terminates
+  if (!providedApp) {
+    app.delete()
+  }
 
-	return stats;
+  const { scannedFiles, executedFiles, added, created, updated, set, deleted } = stats
+  log('Finished all firestore migrations')
+  log(`Files scanned:${scannedFiles} executed:${executedFiles}`)
+  showstats && console.log(`Docs added:${added} created:${created} updated:${updated} set:${set} deleted:${deleted}`)
+
+  statsMap.delete(stats)
+
+  return stats
 }
 
-
-function writeFileSyncRecursive(filename, content, charset) {
+function writeFileSyncRecursive (filename, content, charset) {
   const folders = filename.split(path.sep).slice(0, -1)
   if (folders.length) {
     // create folder path if it doesn't exist
@@ -380,21 +377,19 @@ function writeFileSyncRecursive(filename, content, charset) {
   fs.writeFileSync(filename, content, charset)
 }
 
-async function addMigration (name, {path: dir = ''} = {}) {
+async function addMigration (name, { path: dir = '' } = {}) {
+  // Create filename of the form: [YYYY-MM-DD]_[HH:mm:ss]_[name].ts
+  const d = new Date()
+  const filename = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}_${d.getUTCHours()}-${d.getUTCMinutes()}-${d.getUTCSeconds()}_${name}.ts`
 
-	// Create filename of the form: [YYYY-MM-DD]_[HH:mm:ss]_[name].ts
-	const d = new Date()
-	const filename = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}_${d.getUTCHours()}-${d.getUTCMinutes()}-${d.getUTCSeconds()}_${name}.ts`;
+  const filepath = path.resolve(dir, filename)
 
-	const filepath = path.resolve(dir, filename);
-
-	writeFileSyncRecursive(filepath, `import { MigrateOptions } from "fireway";
+  writeFileSyncRecursive(filepath, `import { MigrateOptions } from "fireway";
 
 module.exports.migrate = async (opts: MigrateOptions) => {
 
 }
-`, 'utf8');
-
+`, 'utf8')
 }
 
-module.exports = {migrate, addMigration};
+module.exports = { migrate, addMigration }
