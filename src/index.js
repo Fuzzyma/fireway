@@ -241,7 +241,7 @@ async function migrate ({ path: dir, projectId, storageBucket, dryrun, app, debu
     if (filename[0] === '.') return null
 
     // Expecting a filename like: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s
-    const match = filename.match(/^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_([^.]+).[jt]s$/)
+    const match = filename.match(/^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})_(.+).[jt]s$/)
     if (!match) {
       throw new Error(`Invalid filename: ${filename}. Expecting: [YYYY-MM-DD]_[HH-mm-ss]_[name].[jt]s`)
     }
@@ -380,7 +380,7 @@ function writeFileSyncRecursive (filename, content, charset) {
 // Create filename of the form: [YYYY-MM-DD]_[HH:mm:ss]_[name].ts
 function getFileName (name, ext = 'ts') {
   const d = new Date()
-  const filename = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}_${d.getUTCHours()}-${d.getUTCMinutes()}-${d.getUTCSeconds()}_${name}.${ext}`
+  const filename = `${d.getUTCFullYear()}-${(d.getUTCMonth() + 1).toString().padStart(2, '0')}-${d.getUTCDate().toString().padStart(2, '0')}_${d.getUTCHours().toString().padStart(2, '0')}-${d.getUTCMinutes().toString().padStart(2, '0')}-${d.getUTCSeconds().toString().padStart(2, '0')}_${name}${ext ? '.' : ''}${ext}`
   return filename
 }
 
@@ -404,9 +404,7 @@ async function convert ({ path: dir = '' } = {}) {
   // Split by __ to get semver and name
   filenames.forEach(filename => {
     if (filename[0] === '.') return null
-    const ext = path.extname(filename)
-
-    const newFileName = getFileName(filename, ext)
+    const newFileName = getFileName(filename, '')
 
     // rename the file
     fs.renameSync(path.join(dir, filename), path.join(dir, newFileName))
