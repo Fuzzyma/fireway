@@ -51,4 +51,17 @@ prog.command('migrate add <name>')
     }
   })
 
+prog.command('convert')
+  .describe('Converts old naming schemen to new')
+  .option('--path', 'Path to migration files', './migrations')
+  .example('convert --path=./migrations')
+  .action(async (name, opts) => {
+    try {
+      await fireway.convert(name, opts)
+    } catch (e) {
+      console.log('ERROR:', e.message)
+      process.exit(1)
+    }
+  })
+
 prog.parse(process.argv)

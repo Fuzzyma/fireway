@@ -377,11 +377,15 @@ function writeFileSyncRecursive (filename, content, charset) {
   fs.writeFileSync(filename, content, charset)
 }
 
-async function addMigration (name, { path: dir = '' } = {}) {
-  // Create filename of the form: [YYYY-MM-DD]_[HH:mm:ss]_[name].ts
+// Create filename of the form: [YYYY-MM-DD]_[HH:mm:ss]_[name].ts
+function getFileName (name, ext = 'ts') {
   const d = new Date()
-  const filename = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}_${d.getUTCHours()}-${d.getUTCMinutes()}-${d.getUTCSeconds()}_${name}.ts`
+  const filename = `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}_${d.getUTCHours()}-${d.getUTCMinutes()}-${d.getUTCSeconds()}_${name}.${ext}`
+  return filename
+}
 
+async function addMigration (name, { path: dir = '' } = {}) {
+  const filename = getFileName(name)
   const filepath = path.resolve(dir, filename)
 
   writeFileSyncRecursive(filepath, `import { MigrateOptions } from "fireway";
@@ -392,4 +396,21 @@ module.exports.migrate = async (opts: MigrateOptions) => {
 `, 'utf8')
 }
 
-module.exports = { migrate, addMigration }
+// Converts old file naming scheme to new one
+async function convert ({ path: dir = '' } = {}) {
+  // Read the files in the directory
+  const filenames = await readdir(dir)
+
+  // Split by __ to get semver and name
+  filenames.forEach(filename => {
+    if (filename[0] === '.') return null
+    const ext = path.extname(filename)
+
+    const newFileName = getFileName(filename, ext)
+
+    // rename the file
+    fs.renameSync(path.join(dir, filename), path.join(dir, newFileName))
+  })
+}
+
+module.exports = { migrate, addMigration, convert }
