@@ -282,7 +282,7 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 
 	const collection = firestore.collection('fireway');
 
-	const migrationDocs = await collection.orderBy('name').get()
+	const migrationDocs = await collection.orderBy('filename').get()
 
 	let doc
 	while (doc = migrationDocs.docs.shift()) {
@@ -290,12 +290,17 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 			files.shift()
 			continue
 		} else {
+			const index = files.findIndex(file => file.filename === doc.filename)
+			if (index > -1) {
+				files.splice(index, 1)
+				console.warn('Migrations were not run in order. Please make sure that migration succeeded.')
+			}
 			break
 		}
 	}
 
 	if (migrationDocs.length) {
-		throw new Error('Migrations were not run in order. Roll back database and try again.')
+		console.warn('The following migrations existed before but a corresponding file wasnt found:', migrationDocs.map(doc => doc.filename))
 	}
 
 	log(`Executing ${files.length} migration files`);
@@ -336,9 +341,7 @@ async function migrate({path: dir, projectId, storageBucket, dryrun, app, debug 
 
 		// Freeze stat tracking
 		stats.frozen = true;
-
-		installed_rank += 1;
-		await collection.doc(id).set({
+		await collection.doc(file.filename).set({
 			filename: file.filename
 		});
 
